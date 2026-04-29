@@ -1,0 +1,5 @@
+apscheduler
+feedparser
+jinja2
+requests
+
