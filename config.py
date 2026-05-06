@@ -7,16 +7,24 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your-key")
 
 ALPACA_KEY = os.getenv("ALPACA_KEY", "your-key")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET", "your-key")
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # --- Capital / risk knobs ---
 CAPITAL = float(os.getenv("CAPITAL", "1000.0"))
 NARRATIVE_THRESHOLD = float(os.getenv("NARRATIVE_THRESHOLD", "25"))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.10"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
+MAX_DAY_MOVE_PCT = float(os.getenv("MAX_DAY_MOVE_PCT", "0.30"))
+MAX_MARKET_CAP = int(float(os.getenv("MAX_MARKET_CAP", "500000000")))
+MAX_FLOAT_SHARES = int(float(os.getenv("MAX_FLOAT_SHARES", "50000000")))
 
 # --- Data sources (two only) ---
 REUTERS_RSS = "https://feeds.reuters.com/reuters/businessNews"
 AP_RSS = "https://rsshub.app/apnews/topics/business"
+EDGAR_CURRENT_8K_ATOM = os.getenv(
+    "EDGAR_CURRENT_8K_ATOM",
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=100&output=atom",
+)
 
 # SEC requires a descriptive User-Agent with contact info.
 SEC_USER_AGENT = os.getenv(
@@ -26,6 +34,22 @@ SEC_USER_AGENT = os.getenv(
 
 # Gemini
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+HIGH_SIGNAL_8K_ITEMS = {
+    "1.01",  # Entry into a material definitive agreement.
+    "1.03",  # Bankruptcy or receivership.
+    "2.02",  # Results of operations and financial condition.
+    "8.01",  # Other events.
+}
+
+ITEM_WEIGHTS = {
+    "1.01": 30,
+    "2.02": 25,
+    "8.01": 20,
+    "1.03": 15,
+    "5.02": 5,
+    "7.01": 2,
+}
 
 # --- Watchlist (40-50 mid-cap tickers across sectors) ---
 WATCHLIST = [
@@ -62,4 +86,3 @@ WATCHLIST = [
     "HUBB",
     "EMR",
 ]
-

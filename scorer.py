@@ -8,6 +8,7 @@ from collections import defaultdict
 import config
 from db import db_session
 from prices import latest_close_and_close_24h_ago
+from signal_filter import is_tradeable, item_score
 
 
 def _logger() -> logging.Logger:
@@ -70,7 +71,7 @@ def _kelly_dollar_size(win_rate: float) -> float:
 
 def _prices_ok_24h(ticker: str) -> tuple[bool, float | None]:
     """
-    Returns (ok, current_price). ok means abs(move_24h) < 1%.
+    Returns (ok, current_price). ok means the name is not already up too much.
     """
     try:
         now_price, ref_price = latest_close_and_close_24h_ago(ticker)
@@ -78,8 +79,8 @@ def _prices_ok_24h(ticker: str) -> tuple[bool, float | None]:
         return False, None
     if ref_price <= 0:
         return False, now_price
-    move = abs(now_price - ref_price) / ref_price
-    return move < 0.01, now_price
+    move = (now_price - ref_price) / ref_price
+    return move < config.MAX_DAY_MOVE_PCT, now_price
 
 
 def _recent_bullish_tagged(now: dt.datetime) -> list[dict]:
@@ -87,8 +88,9 @@ def _recent_bullish_tagged(now: dt.datetime) -> list[dict]:
     with db_session() as conn:
         rows = conn.execute(
             """
-            SELECT tickers, catalyst_type, urgency, tagged_at
-            FROM tagged_stories
+            SELECT ts.tickers, ts.catalyst_type, ts.urgency, ts.tagged_at, rs.body, rs.source
+            FROM tagged_stories ts
+            JOIN raw_stories rs ON rs.id = ts.raw_story_id
             WHERE sentiment = 'bullish'
               AND tagged_at >= ?
             ORDER BY tagged_at ASC
@@ -170,33 +172,41 @@ def run() -> None:
         return
 
     # Secondary dedup happens here (same ticker + catalyst within 2h window -> keep max urgency).
-    # Map: (ticker, catalyst_type, window_key) -> (urgency, tagged_at)
-    buckets: dict[tuple[str, str, int], tuple[int, dt.datetime]] = {}
+    # Map: (ticker, catalyst_type, window_key) -> (urgency, tagged_at, item_bonus)
+    buckets: dict[tuple[str, str, int], tuple[int, dt.datetime, float]] = {}
+    ticker_items: dict[str, set[str]] = defaultdict(set)
 
     for r in rows:
         try:
             tickers = json.loads(r["tickers"] or "[]")
         except Exception:
             tickers = []
+        try:
+            payload = json.loads(r["body"] or "{}")
+        except Exception:
+            payload = {}
         catalyst = str(r["catalyst_type"] or "other").strip()
         urgency = int(r["urgency"] or 1)
         tagged_at = _parse_iso(r["tagged_at"])
         win = _window_key(tagged_at, 120)
+        items = payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            items = []
+        bonus = item_score(items)
         for t in tickers:
             ticker = str(t).upper().strip()
-            if ticker not in set(config.WATCHLIST):
-                continue
             key = (ticker, catalyst, win)
             prev = buckets.get(key)
-            if prev is None or urgency > prev[0]:
-                buckets[key] = (urgency, tagged_at)
+            ticker_items[ticker].update(str(item) for item in items)
+            if prev is None or urgency > prev[0] or bonus > prev[2]:
+                buckets[key] = (urgency, tagged_at, bonus)
 
     # Convert buckets into narrative score per ticker.
     scores = defaultdict(float)
-    for (ticker, _catalyst, _win), (urgency, tagged_at) in buckets.items():
+    for (ticker, _catalyst, _win), (urgency, tagged_at, bonus) in buckets.items():
         hours_ago = _hours_since(tagged_at, now)
         decay = 0.95 ** hours_ago
-        scores[ticker] += float(urgency) * decay
+        scores[ticker] += (float(urgency) + bonus) * decay
 
     win_rate = _get_win_rate()
     suggested = _kelly_dollar_size(win_rate)
@@ -207,6 +217,9 @@ def run() -> None:
             continue
         if _signal_exists_recently(ticker, now):
             continue
+        ok_tradeable, tradeable_bonus = is_tradeable(ticker, sorted(ticker_items.get(ticker, set())))
+        if not ok_tradeable:
+            continue
         ok_price, now_price = _prices_ok_24h(ticker)
         if not ok_price or now_price is None:
             continue
@@ -214,16 +227,21 @@ def run() -> None:
         _insert_signal(
             ticker=ticker,
             first_mentioned=first,
-            narrative_score=float(score),
+            narrative_score=float(score + tradeable_bonus),
             price_at_signal=float(now_price),
             suggested_size=float(suggested),
         )
         fired += 1
-        log.info("signal fired ticker=%s score=%.2f price=%.2f size=$%.2f", ticker, score, now_price, suggested)
+        log.info(
+            "signal fired ticker=%s score=%.2f price=%.2f size=$%.2f",
+            ticker,
+            score + tradeable_bonus,
+            now_price,
+            suggested,
+        )
 
     log.info("scorer.run done signals_fired=%s tickers_scored=%s", fired, len(scores))
 
 
 if __name__ == "__main__":
     run()
-

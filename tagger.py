@@ -107,10 +107,34 @@ def _article_text(headline: str, body: str) -> str:
     # Keep payload bounded for the model.
     headline = (headline or "").strip()
     body = (body or "").strip()
-    text = (headline + "\n\n" + body).strip()
+    hints = _story_hints(body)
+    text = (headline + "\n\n" + hints + body).strip()
     if len(text) > 8000:
         text = text[:8000] + "\n\n[TRUNCATED]"
     return text
+
+
+def _story_hints(body: str) -> str:
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+
+    hints: list[str] = []
+    ticker = payload.get("ticker")
+    if isinstance(ticker, str) and ticker.strip():
+        hints.append(f"ticker={ticker.strip().upper()}")
+    form = payload.get("form")
+    if isinstance(form, str) and form.strip():
+        hints.append(f"form={form.strip()}")
+    items = payload.get("items")
+    if isinstance(items, list) and items:
+        hints.append("items=" + ",".join(str(item) for item in items))
+    if not hints:
+        return ""
+    return "[STRUCTURED_HINTS " + " ".join(hints) + "]\n\n"
 
 
 def _fetch_untagged(limit: int = 50) -> list[dict[str, Any]]:
@@ -194,6 +218,13 @@ def run() -> None:
         raw_id = int(row["id"])
         try:
             tagged = _gemini_tag(_article_text(row["headline"], row["body"]))
+            try:
+                payload = json.loads(row["body"] or "{}")
+            except Exception:
+                payload = {}
+            hinted_ticker = payload.get("ticker") if isinstance(payload, dict) else None
+            if not tagged["tickers_mentioned"] and isinstance(hinted_ticker, str) and hinted_ticker.strip():
+                tagged["tickers_mentioned"] = [hinted_ticker.strip().upper()]
             _mark_tagged(raw_id, tagged)
             ok += 1
             log.info(
@@ -213,4 +244,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-

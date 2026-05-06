@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import re
 from typing import Any
 
 import feedparser
@@ -38,6 +39,17 @@ def _now_utc_iso() -> str:
 
 def _yesterday_iso_date() -> str:
     return (dt.datetime.now(dt.UTC) - dt.timedelta(days=1)).date().isoformat()
+
+
+def _extract_ticker(text: str) -> str | None:
+    match = re.search(r"\(([A-Z]{1,5})\)", text or "")
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _extract_8k_items(text: str) -> set[str]:
+    return set(re.findall(r"\b([1-9]\.\d{2})\b", text or ""))
 
 
 def _insert_raw_story(
@@ -147,24 +159,46 @@ def _normalize_edgar_story(src: dict[str, Any], ticker: str) -> tuple[str, str, 
 
 
 def _scrape_edgar(log: logging.Logger) -> int:
-    start_date = _yesterday_iso_date()
+    headers = {"User-Agent": config.SEC_USER_AGENT}
+    response = requests.get(config.EDGAR_CURRENT_8K_ATOM, headers=headers, timeout=25)
+    response.raise_for_status()
+    parsed = feedparser.parse(response.text)
     inserted = 0
-    forms_keep = {"8-K", "4", "10-Q", "10-K"}
+    if getattr(parsed, "bozo", 0):
+        log.warning(
+            "EDGAR current feed parse bozo=1: %s",
+            getattr(parsed, "bozo_exception", ""),
+        )
 
-    for ticker in config.WATCHLIST:
-        try:
-            hits = _fetch_edgar_for_ticker(ticker, start_date)
-        except Exception as e:
-            log.warning("EDGAR fetch failed for %s: %s", ticker, e)
+    for entry in getattr(parsed, "entries", [])[:100]:
+        headline = (getattr(entry, "title", "") or "").strip()
+        summary = (getattr(entry, "summary", "") or "").strip()
+        ticker = _extract_ticker(headline)
+        if not ticker:
             continue
 
-        for src in hits:
-            filing_type = (src.get("formType") or src.get("form") or "").strip()
-            if filing_type and filing_type not in forms_keep:
-                continue
-            url, headline, body = _normalize_edgar_story(src, ticker)
-            if _insert_raw_story(url=url, headline=headline, body=body, source="edgar"):
-                inserted += 1
+        items = sorted(_extract_8k_items(f"{headline}\n{summary}"))
+        if not set(items).intersection(config.HIGH_SIGNAL_8K_ITEMS):
+            continue
+
+        url = _entry_url(entry)
+        if not url:
+            continue
+
+        body = json.dumps(
+            {
+                "ticker": ticker,
+                "form": "8-K",
+                "items": items,
+                "summary": summary,
+                "raw": dict(entry),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        if _insert_raw_story(url=url, headline=headline, body=body, source="edgar"):
+            inserted += 1
+            log.info("captured edgar ticker=%s items=%s", ticker, ",".join(items))
 
     return inserted
 
@@ -217,4 +251,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-
