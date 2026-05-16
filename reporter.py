@@ -9,21 +9,11 @@ import jinja2
 import config
 from db import db_session
 from prices import close_on_or_after
+from runtime import get_logger
 
 
 def _logger() -> logging.Logger:
-    log = logging.getLogger("tradingbot.reporter")
-    if log.handlers:
-        return log
-    log.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    fh = logging.FileHandler("logs/bot.log")
-    fh.setFormatter(formatter)
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    log.addHandler(fh)
-    log.addHandler(sh)
-    return log
+    return get_logger("tradingbot.reporter")
 
 
 def _now_utc() -> dt.datetime:
@@ -240,4 +230,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-

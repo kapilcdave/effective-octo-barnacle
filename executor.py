@@ -9,21 +9,11 @@ import requests
 
 import config
 from db import db_session
+from runtime import get_logger
 
 
 def _logger() -> logging.Logger:
-    log = logging.getLogger("tradingbot.executor")
-    if log.handlers:
-        return log
-    log.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    fh = logging.FileHandler("logs/bot.log")
-    fh.setFormatter(formatter)
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    log.addHandler(fh)
-    log.addHandler(sh)
-    return log
+    return get_logger("tradingbot.executor")
 
 
 def _alpaca_request(method: str, path: str, *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -39,12 +29,22 @@ def _alpaca_request(method: str, path: str, *, payload: dict[str, Any] | None = 
     }
     url = config.ALPACA_BASE_URL.rstrip("/") + path
     response = requests.request(method, url, headers=headers, json=payload, timeout=30)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as e:
+        request_id = response.headers.get("X-Request-ID", "")
+        detail = response.text.strip()
+        suffix = f" x-request-id={request_id}" if request_id else ""
+        raise RuntimeError(f"Alpaca {method} {path} failed: {response.status_code} {detail}{suffix}") from e
     return response.json()
 
 
+def get_account() -> dict[str, Any]:
+    return _alpaca_request("GET", "/v2/account")
+
+
 def _get_account_equity() -> float:
-    account = _alpaca_request("GET", "/v2/account")
+    account = get_account()
     return float(account["equity"])
 
 
@@ -67,7 +67,7 @@ def _position_value(signal: dict[str, Any], equity: float) -> float:
     return max(0.0, min(suggested, max_allowed))
 
 
-def submit_signal(signal_id: int) -> dict[str, Any]:
+def build_order(signal_id: int) -> dict[str, Any]:
     signal = _load_signal(signal_id)
     if not signal:
         raise RuntimeError(f"Signal {signal_id} not found")
@@ -95,17 +95,43 @@ def submit_signal(signal_id: int) -> dict[str, Any]:
         "take_profit": {"limit_price": round(price * 1.25, 2)},
         "client_order_id": f"signal-{signal_id}",
     }
-    return _alpaca_request("POST", "/v2/orders", payload=order_payload)
+    return order_payload
+
+
+def submit_signal(signal_id: int) -> dict[str, Any]:
+    return _alpaca_request("POST", "/v2/orders", payload=build_order(signal_id))
+
+
+def _usage(log: logging.Logger) -> None:
+    log.error("usage: python executor.py account | dry-run <signal_id> | submit <signal_id>")
 
 
 def run(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     log = _logger()
-    if len(args) != 1:
-        log.error("usage: python executor.py <signal_id>")
+    if not args:
+        _usage(log)
         return 2
 
-    signal_id = int(args[0])
+    if args[0] == "account" and len(args) == 1:
+        print(json.dumps(get_account(), indent=2, sort_keys=True))
+        return 0
+
+    # Backward compatibility: `python executor.py 123` submits signal 123.
+    command = "submit" if len(args) == 1 else args[0]
+    signal_arg = args[0] if len(args) == 1 else args[1]
+
+    if command not in {"dry-run", "submit"}:
+        _usage(log)
+        return 2
+
+    signal_id = int(signal_arg)
+    if command == "dry-run":
+        order = build_order(signal_id)
+        log.info("built dry-run signal_id=%s symbol=%s qty=%s", signal_id, order["symbol"], order["qty"])
+        print(json.dumps(order, indent=2, sort_keys=True))
+        return 0
+
     order = submit_signal(signal_id)
     log.info("submitted signal_id=%s order_id=%s", signal_id, order.get("id"))
     print(json.dumps(order, indent=2, sort_keys=True))
@@ -113,4 +139,8 @@ def run(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    try:
+        raise SystemExit(run())
+    except Exception as e:
+        _logger().error("%s", e)
+        raise SystemExit(1)

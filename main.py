@@ -6,24 +6,14 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from db import db_session
 import reporter
+from runtime import get_logger
 import scorer
 import scraper
 import tagger
 
 
 def _logger() -> logging.Logger:
-    log = logging.getLogger("tradingbot.main")
-    if log.handlers:
-        return log
-    log.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    fh = logging.FileHandler("logs/bot.log")
-    fh.setFormatter(formatter)
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    log.addHandler(fh)
-    log.addHandler(sh)
-    return log
+    return get_logger("tradingbot.main")
 
 
 def _safe(job_name: str, fn):
@@ -56,4 +46,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -8,22 +8,12 @@ from collections import defaultdict
 import config
 from db import db_session
 from prices import latest_close_and_close_24h_ago
+from runtime import get_logger
 from signal_filter import is_tradeable, item_score
 
 
 def _logger() -> logging.Logger:
-    log = logging.getLogger("tradingbot.scorer")
-    if log.handlers:
-        return log
-    log.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    fh = logging.FileHandler("logs/bot.log")
-    fh.setFormatter(formatter)
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    log.addHandler(fh)
-    log.addHandler(sh)
-    return log
+    return get_logger("tradingbot.scorer")
 
 
 def _now_utc() -> dt.datetime:

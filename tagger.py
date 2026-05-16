@@ -11,6 +11,7 @@ import requests
 
 import config
 from db import db_session
+from runtime import get_logger
 
 
 TAGGING_SYSTEM = (
@@ -33,18 +34,7 @@ Article: {article_text}
 
 
 def _logger() -> logging.Logger:
-    log = logging.getLogger("tradingbot.tagger")
-    if log.handlers:
-        return log
-    log.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    fh = logging.FileHandler("logs/bot.log")
-    fh.setFormatter(formatter)
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    log.addHandler(fh)
-    log.addHandler(sh)
-    return log
+    return get_logger("tradingbot.tagger")
 
 
 def _now_utc_iso() -> str:

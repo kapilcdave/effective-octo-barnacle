@@ -2,11 +2,25 @@ from __future__ import annotations
 
 import os
 
+
+def _env_first(*names: str, default: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
 # --- Secrets (prefer environment variables) ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your-key")
 
-ALPACA_KEY = os.getenv("ALPACA_KEY", "your-key")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET", "your-key")
+ALPACA_KEY = _env_first("ALPACA_KEY", "APCA_API_KEY_ID", "APCA-API-KEY-ID", default="your-key")
+ALPACA_SECRET = _env_first(
+    "ALPACA_SECRET",
+    "APCA_API_SECRET_KEY",
+    "APCA-API-SECRET-KEY",
+    default="your-key",
+)
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # --- Capital / risk knobs ---
