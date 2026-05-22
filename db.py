@@ -63,6 +63,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_raw_stories_tagged ON raw_stories(tagged);
         CREATE INDEX IF NOT EXISTS idx_tagged_stories_tagged_at ON tagged_stories(tagged_at);
         CREATE INDEX IF NOT EXISTS idx_signals_ticker_created ON signals(ticker, created_at);
+
+        CREATE TABLE IF NOT EXISTS scraper_state (
+          feed_key            TEXT PRIMARY KEY,
+          last_seen_url       TEXT,
+          last_seen_published TEXT,
+          etag                TEXT,
+          updated_at          DATETIME
+        );
         """
     )
     conn.commit()

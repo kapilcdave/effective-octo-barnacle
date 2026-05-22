@@ -65,6 +65,27 @@ ITEM_WEIGHTS = {
     "7.01": 2,
 }
 
+# --- Scraper knobs ---
+RSS_MAX_ENTRIES = int(os.getenv("RSS_MAX_ENTRIES", "20"))
+RSS_MAX_AGE_HOURS = float(os.getenv("RSS_MAX_AGE_HOURS", "48"))
+EDGAR_ATOM_MAX_ENTRIES = int(os.getenv("EDGAR_ATOM_MAX_ENTRIES", "100"))
+EDGAR_BACKFILL_ENABLED = os.getenv("EDGAR_BACKFILL_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+SEC_REQUEST_DELAY_SEC = float(os.getenv("SEC_REQUEST_DELAY_SEC", "0.12"))
+
+RSS_CATALYST_KEYWORDS = tuple(
+    kw.strip().lower()
+    for kw in os.getenv(
+        "RSS_CATALYST_KEYWORDS",
+        "earnings,guidance,fda,partnership,bankruptcy,acquisition,merger,"
+        "outlook,revenue,profit,ceo,cfo,dividend,buyback,lawsuit,regulation",
+    ).split(",")
+    if kw.strip()
+)
+
 # --- Watchlist (40-50 mid-cap tickers across sectors) ---
 WATCHLIST = [
     # Semiconductors
@@ -100,3 +121,5 @@ WATCHLIST = [
     "HUBB",
     "EMR",
 ]
+
+WATCHLIST_SET = frozenset(WATCHLIST)
