@@ -166,6 +166,13 @@ def _mark_tagged(raw_id: int, tagged_row: dict[str, Any]) -> None:
         conn.execute("UPDATE raw_stories SET tagged = 1 WHERE id = ?", (raw_id,))
 
 
+def _redact(text: str) -> str:
+    key = config.GEMINI_API_KEY
+    if key and key != "your-key":
+        text = text.replace(key, "***REDACTED***")
+    return text
+
+
 def _gemini_tag(article_text: str) -> dict[str, Any]:
     if not config.GEMINI_API_KEY or config.GEMINI_API_KEY == "your-key":
         raise RuntimeError("GEMINI_API_KEY not set")
@@ -173,26 +180,60 @@ def _gemini_tag(article_text: str) -> dict[str, Any]:
     prompt = TAGGING_USER_TEMPLATE.format(article_text=article_text)
     model = config.GEMINI_MODEL
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    params = {"key": config.GEMINI_API_KEY}
+    # Header auth, never a query param: requests echoes the full URL in HTTPError
+    # messages, which put the API key into logs/bot.log in plaintext.
+    headers = {"x-goog-api-key": config.GEMINI_API_KEY, "Content-Type": "application/json"}
+    generation_config: dict[str, Any] = {
+        "temperature": 0.2,
+        "maxOutputTokens": config.GEMINI_MAX_OUTPUT_TOKENS,
+        "responseMimeType": "application/json",
+    }
+    if config.GEMINI_DISABLE_THINKING:
+        # Thinking models (gemini-flash-latest) spend the output budget on hidden
+        # reasoning and can return an empty candidate. Non-thinking models
+        # (gemini-flash-lite-latest) reject this field with 400 INVALID_ARGUMENT.
+        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+
     payload = {
         "system_instruction": {"parts": [{"text": TAGGING_SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 512,
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": generation_config,
     }
-    r = requests.post(url, params=params, json=payload, timeout=45)
-    r.raise_for_status()
-    data = r.json()
-    candidates = data.get("candidates") or []
-    parts = (((candidates[0] or {}).get("content") or {}).get("parts") or []) if candidates else []
-    text = (parts[0].get("text") if parts and isinstance(parts[0], dict) else "") or ""
-    text = text.strip()
-    if not text:
-        raise ValueError(f"Empty model response: {data}")
-    return _coerce_result(_extract_json(text))
+
+    attempts = max(1, config.GEMINI_MAX_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        r = requests.post(url, headers=headers, json=payload, timeout=45)
+        if r.status_code == 429 and attempt < attempts:
+            time.sleep(_retry_delay_seconds(r, attempt))
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(
+                "Gemini {} {}: {}".format(r.status_code, model, _redact(r.text.strip())[:300])
+            )
+        data = r.json()
+        candidates = data.get("candidates") or []
+        parts = (((candidates[0] or {}).get("content") or {}).get("parts") or []) if candidates else []
+        text = (parts[0].get("text") if parts and isinstance(parts[0], dict) else "") or ""
+        text = text.strip()
+        if not text:
+            finish = (candidates[0] or {}).get("finishReason") if candidates else "?"
+            raise ValueError(f"Empty model response (finishReason={finish})")
+        return _coerce_result(_extract_json(text))
+
+    raise RuntimeError(f"Gemini rate limited after {attempts} attempts (model={model})")
+
+
+def _retry_delay_seconds(response: requests.Response, attempt: int) -> float:
+    """Honour Google's RetryInfo when present, else exponential backoff."""
+    try:
+        for detail in ((response.json().get("error") or {}).get("details") or []):
+            delay = str(detail.get("retryDelay") or "")
+            if delay.endswith("s"):
+                return min(float(delay[:-1]) + 1.0, 120.0)
+    except Exception:
+        pass
+    return min(5.0 * (2 ** (attempt - 1)), 120.0)
+
 
 
 def run() -> None:
@@ -226,7 +267,7 @@ def run() -> None:
                 tagged["urgency"],
             )
         except Exception as e:
-            log.warning("tagger failed raw_id=%s: %s", raw_id, e)
+            log.warning("tagger failed raw_id=%s: %s", raw_id, _redact(str(e)))
         time.sleep(4)
 
     log.info("tagger.run done tagged_ok=%s total=%s", ok, len(batch))

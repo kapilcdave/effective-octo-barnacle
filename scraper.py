@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -13,7 +14,9 @@ from typing import Any
 import feedparser
 import requests
 
+import alpaca
 import config
+import edgar
 from db import db_session
 from runtime import get_logger
 
@@ -32,10 +35,6 @@ def _now_utc() -> dt.datetime:
 
 def _now_utc_iso() -> str:
     return _now_utc().replace(microsecond=0).isoformat()
-
-
-def _yesterday_iso_date() -> str:
-    return (_now_utc() - dt.timedelta(days=1)).date().isoformat()
 
 
 @dataclass
@@ -74,16 +73,38 @@ def _extract_ticker(text: str) -> str | None:
     return match.group(1)
 
 
+def _ticker_from_edgar_title(text: str, *, session: requests.Session | None = None) -> str | None:
+    """EDGAR titles carry a CIK, not a ticker: `8-K - Marpai, Inc. (0001844392) (Filer)`.
+
+    Resolve via the SEC's official CIK->ticker map, falling back to a literal
+    ticker in parens for non-EDGAR sources.
+    """
+    for match in re.finditer(r"\((\d{4,10})\)", text or ""):
+        ticker = edgar.ticker_for_cik(match.group(1), session=session)
+        if ticker:
+            return ticker
+    return _extract_ticker(text)
+
+
+# Explicit ticker notations only. A bare word-boundary match on the watchlist
+# attributes every headline containing "ON", "AR" or "GE" to ON Semiconductor,
+# Antero Resources or General Electric.
+_TICKER_PATTERNS = (
+    re.compile(r"\((?:NYSE|NASDAQ|NYSE\s*AMERICAN|AMEX|CBOE|OTCQB|OTCQX|OTC)\s*:\s*([A-Z][A-Z.]{0,5})\)"),
+    re.compile(r"(?:NYSE|NASDAQ|NYSE\s*AMERICAN|AMEX|CBOE|OTCQB|OTCQX|OTC)\s*:\s*([A-Z][A-Z.]{0,5})\b"),
+    re.compile(r"\(([A-Z]{1,5})\)"),
+    re.compile(r"\$([A-Z]{1,5})\b"),
+)
+
+
 def _extract_watchlist_tickers(text: str) -> set[str]:
     blob = (text or "").upper()
     found: set[str] = set()
-    for match in re.finditer(r"\(([A-Z]{1,5})\)", blob):
-        symbol = match.group(1)
-        if symbol in config.WATCHLIST_SET:
-            found.add(symbol)
-    for symbol in config.WATCHLIST_SET:
-        if re.search(rf"\b{re.escape(symbol)}\b", blob):
-            found.add(symbol)
+    for pattern in _TICKER_PATTERNS:
+        for match in pattern.finditer(blob):
+            symbol = match.group(1).strip(".")
+            if symbol in config.WATCHLIST_SET:
+                found.add(symbol)
     return found
 
 
@@ -113,6 +134,11 @@ def _rss_matches_filters(headline: str, summary: str) -> bool:
     blob = f"{headline}\n{summary}"
     if _extract_watchlist_tickers(blob):
         return True
+    if config.RSS_REQUIRE_WATCHLIST_TICKER:
+        # Keyword-only matches drag in the whole newswire firehose (foreign-language
+        # CFO notices, law-firm releases, microcaps), all of which get dropped later
+        # by the watchlist and tradeability gates after paying for a Gemini call.
+        return False
     lower = blob.lower()
     return any(kw in lower for kw in config.RSS_CATALYST_KEYWORDS)
 
@@ -156,15 +182,17 @@ def _save_feed_state(
 class StoryBatch:
     def __init__(self, conn: Any) -> None:
         self._conn = conn
-        self._rows: list[tuple[str, str, str, str, str, str, str]] = []
+        self._rows: list[tuple[str, str, str, str, str, str]] = []
 
     def add(self, *, url: str, headline: str, body: str, source: str) -> None:
         fetched_at = _now_utc_iso()
-        self._rows.append((_sha256(url), url, headline, body, source, fetched_at, 0))
+        # `tagged` is a literal 0 in the INSERT, so it must not be bound here.
+        self._rows.append((_sha256(url), url, headline, body, source, fetched_at))
 
     def flush(self) -> tuple[int, int]:
         if not self._rows:
             return 0, 0
+        log = _logger()
         inserted = 0
         duplicates = 0
         for row in self._rows:
@@ -177,86 +205,15 @@ class StoryBatch:
                     row,
                 )
                 inserted += 1
-            except Exception:
+            except sqlite3.IntegrityError:
+                # url_hash is UNIQUE: a genuine repeat of a story we already have.
                 duplicates += 1
+            except Exception as e:
+                # Never swallow this again: a binding/schema bug counted every
+                # insert as a duplicate and silently emptied the pipeline.
+                log.error("story insert failed url=%s: %s: %s", row[1], type(e).__name__, e)
         self._rows.clear()
         return inserted, duplicates
-
-
-def _fetch_edgar_for_ticker(
-    session: requests.Session,
-    ticker: str,
-    start_date: str,
-) -> list[dict[str, Any]]:
-    url = (
-        "https://efts.sec.gov/LATEST/search-index"
-        f"?q={ticker}&forms=8-K&dateRange=custom&startdt={start_date}"
-    )
-    r = session.get(url, timeout=25)
-    r.raise_for_status()
-    payload = r.json()
-
-    hits_obj = payload.get("hits")
-    hits: list[Any] = []
-    if isinstance(hits_obj, dict):
-        hits = hits_obj.get("hits", []) or []
-    elif isinstance(hits_obj, list):
-        hits = hits_obj
-
-    out: list[dict[str, Any]] = []
-    for h in hits:
-        src = h.get("_source", h) if isinstance(h, dict) else {}
-        if isinstance(src, dict):
-            out.append(src)
-    return out
-
-
-def _edgar_story_url(src: dict[str, Any]) -> str:
-    for key in ("linkToFilingDetails", "linkToHtml", "linkToTxt"):
-        v = src.get(key)
-        if isinstance(v, str) and v.startswith("http"):
-            return v
-
-    cik = src.get("cik") or src.get("cikNumber") or src.get("cik_number")
-    accession = (
-        src.get("adsh")
-        or src.get("accessionNumber")
-        or src.get("accession_number")
-        or src.get("accn")
-    )
-    if cik and accession:
-        try:
-            cik_int = int(str(cik))
-            acc = str(accession).replace("-", "")
-            return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc}/"
-        except Exception:
-            pass
-
-    return "edgar-search://" + _sha256(json.dumps(src, sort_keys=True, default=str))
-
-
-def _normalize_edgar_story(src: dict[str, Any], ticker: str) -> tuple[str, str, str]:
-    filing_type = src.get("formType") or src.get("form") or src.get("file_type") or ""
-    filed_at = src.get("filedAt") or src.get("filed_at") or src.get("filed") or ""
-    title = src.get("title") or src.get("display_names") or src.get("entityName") or ""
-
-    headline = f"{ticker} {filing_type}".strip()
-    if title:
-        headline = f"{headline} — {title}".strip(" —")
-
-    summary = src.get("summary") or src.get("description") or ""
-    items = sorted(_extract_8k_items(f"{headline}\n{summary}"))
-    body_obj = {
-        "ticker": ticker,
-        "form": filing_type or "8-K",
-        "filed_at": filed_at,
-        "items": items,
-        "summary": summary,
-        "raw": src,
-    }
-    body = json.dumps(body_obj, ensure_ascii=False, default=str)
-    url = _edgar_story_url(src)
-    return url, headline, body
 
 
 def _entry_url(entry: Any) -> str | None:
@@ -297,10 +254,11 @@ def _process_edgar_atom_entry(
     stats: SkipStats,
     *,
     log: logging.Logger,
+    session: requests.Session | None = None,
 ) -> bool:
     headline = (getattr(entry, "title", "") or "").strip()
     summary = (getattr(entry, "summary", "") or "").strip()
-    ticker = _extract_ticker(headline)
+    ticker = _ticker_from_edgar_title(headline, session=session)
     if not ticker:
         stats.skip("no_ticker")
         return False
@@ -331,34 +289,6 @@ def _process_edgar_atom_entry(
     )
     batch.add(url=url, headline=headline, body=body, source="edgar")
     log.info("queued edgar atom ticker=%s items=%s", ticker, ",".join(items))
-    return True
-
-
-def _process_edgar_search_hit(
-    src: dict[str, Any],
-    ticker: str,
-    batch: StoryBatch,
-    stats: SkipStats,
-) -> bool:
-    filing_type = str(src.get("formType") or src.get("form") or src.get("file_type") or "")
-    if filing_type and "8-K" not in filing_type.upper():
-        stats.skip("not_8k")
-        return False
-
-    url, headline, body = _normalize_edgar_story(src, ticker)
-    try:
-        payload = json.loads(body)
-    except Exception:
-        stats.skip("bad_body")
-        return False
-    items = payload.get("items") if isinstance(payload, dict) else []
-    if not isinstance(items, list):
-        items = []
-    if not set(items).intersection(config.HIGH_SIGNAL_8K_ITEMS):
-        stats.skip("no_high_signal_item")
-        return False
-
-    batch.add(url=url, headline=headline, body=body, source="edgar")
     return True
 
 
@@ -401,7 +331,7 @@ def _scrape_edgar_atom(
             stats.skip("cursor_hit")
             break
 
-        _process_edgar_atom_entry(entry, batch, stats, log=log)
+        _process_edgar_atom_entry(entry, batch, stats, log=log, session=session)
 
     if newest_url:
         _save_feed_state(
@@ -413,23 +343,88 @@ def _scrape_edgar_atom(
         )
 
 
+def _process_edgar_filing(
+    filing: dict[str, Any],
+    batch: StoryBatch,
+    stats: SkipStats,
+    log: logging.Logger,
+    session: requests.Session | None = None,
+) -> bool:
+    """Queue one 8-K from data.sec.gov/submissions (items already parsed by the SEC)."""
+    items = sorted(str(i).strip() for i in (filing.get("items") or []) if str(i).strip())
+    if not items:
+        stats.skip("no_items")
+        return False
+    if not set(items).intersection(config.HIGH_SIGNAL_8K_ITEMS):
+        stats.skip("no_high_signal_item")
+        return False
+
+    ticker = str(filing["ticker"]).upper()
+    headline = "{} 8-K — {}".format(ticker, filing.get("company") or "")
+    description = str(filing.get("description") or "").strip()
+    if description:
+        headline = "{}: {}".format(headline, description)
+
+    # Item codes alone carry no direction: a beat and a miss are both "2.02".
+    content = ""
+    content_url = None
+    if config.EDGAR_FETCH_DOCUMENT_TEXT:
+        content, content_url = edgar.filing_content_text(
+            filing, session=session, max_chars=config.EDGAR_DOC_MAX_CHARS
+        )
+        if not content:
+            stats.skip("no_document_text")
+            log.info("no document text ticker=%s acc=%s", ticker, filing.get("accession"))
+
+    body = json.dumps(
+        {
+            "ticker": ticker,
+            "form": "8-K",
+            "items": items,
+            "filed_at": filing.get("accepted_at") or filing.get("filing_date"),
+            "summary": "Items " + ", ".join(items),
+            "content": content,
+            "content_url": content_url,
+            "raw": filing,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    batch.add(url=str(filing["url"]), headline=headline, body=body, source="edgar")
+    log.info(
+        "queued edgar filing ticker=%s date=%s items=%s doc=%s chars=%s",
+        ticker,
+        filing.get("filing_date"),
+        ",".join(items),
+        (content_url or "-").rsplit("/", 1)[-1],
+        len(content),
+    )
+    return True
+
+
 def _scrape_edgar_backfill(
     session: requests.Session,
     batch: StoryBatch,
     stats: SkipStats,
     log: logging.Logger,
 ) -> None:
-    start_date = _yesterday_iso_date()
+    """Per-ticker 8-K pull straight from the SEC submissions API.
+
+    Replaces the old efts.sec.gov full-text search, which matched any filing
+    merely *mentioning* the ticker (AMD returned Spansion filings from 2005)
+    and ignored the date window.
+    """
+    since = (_now_utc() - dt.timedelta(days=config.EDGAR_BACKFILL_DAYS)).date()
     for ticker in config.WATCHLIST:
         try:
-            hits = _fetch_edgar_for_ticker(session, ticker, start_date)
+            filings = edgar.recent_8k_filings(ticker, since=since, session=session)
         except Exception as e:
             stats.skip("backfill_error")
             log.warning("edgar backfill failed ticker=%s: %s", ticker, e)
             continue
 
-        for src in hits:
-            _process_edgar_search_hit(src, ticker, batch, stats)
+        for filing in filings:
+            _process_edgar_filing(filing, batch, stats, log, session)
 
         time.sleep(config.SEC_REQUEST_DELAY_SEC)
 
@@ -513,6 +508,81 @@ def _scrape_rss_feed(
         )
 
 
+def _scrape_alpaca_news(
+    batch: StoryBatch,
+    stats: SkipStats,
+    log: logging.Logger,
+) -> None:
+    """Alpaca's Benzinga news feed, filtered to watchlist symbols.
+
+    Articles arrive already tagged with tickers, so there is no ticker guessing
+    and no foreign-language newswire noise.
+    """
+    start = (_now_utc() - dt.timedelta(hours=config.ALPACA_NEWS_LOOKBACK_HOURS)).replace(microsecond=0)
+    articles = alpaca.news(
+        sorted(config.WATCHLIST_SET),
+        start=start.isoformat().replace("+00:00", "Z"),
+        limit=config.ALPACA_NEWS_LIMIT,
+    )
+
+    for article in articles:
+        symbols = [str(s).upper() for s in (article.get("symbols") or [])]
+        watchlist_hits = sorted(set(symbols) & config.WATCHLIST_SET)
+        if not watchlist_hits:
+            stats.skip("not_on_watchlist")
+            continue
+
+        url = str(article.get("url") or "").strip()
+        headline = str(article.get("headline") or "").strip()
+        if not headline:
+            stats.skip("no_headline")
+            continue
+        if not url:
+            url = "alpaca-news://" + str(article.get("id") or _sha256(headline))
+
+        body = json.dumps(
+            {
+                "ticker": watchlist_hits[0],
+                "tickers": watchlist_hits,
+                "form": "news",
+                "summary": str(article.get("summary") or ""),
+                "filed_at": article.get("created_at"),
+                "raw": {
+                    "id": article.get("id"),
+                    "source": article.get("source"),
+                    "author": article.get("author"),
+                    "symbols": symbols,
+                },
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        batch.add(url=url, headline=headline, body=body, source="alpaca_news")
+        log.info("queued alpaca news tickers=%s %s", ",".join(watchlist_hits), headline[:60])
+
+
+def _run_source(
+    name: str,
+    fn: Any,
+    stats: SkipStats,
+    log: logging.Logger,
+) -> None:
+    """Run one source in isolation.
+
+    A single dead feed must never abort the run: the old code let a DNS failure
+    on the Reuters feed propagate out of run(), so batch.flush() never executed
+    and nothing was committed at all.
+    """
+    source_stats = SkipStats()
+    try:
+        fn(source_stats)
+    except Exception as e:
+        source_stats.skip("source_error")
+        log.warning("source failed %s: %s: %s", name, type(e).__name__, e)
+    stats.merge(source_stats)
+    source_stats.log_summary(log, name)
+
+
 def run() -> None:
     log = _logger()
     log.info("scraper.run start")
@@ -520,38 +590,43 @@ def run() -> None:
 
     session = _sec_session()
     inserted = 0
+    duplicates = 0
     try:
         with db_session() as conn:
             batch = StoryBatch(conn)
 
-            edgar_stats = SkipStats()
-            _scrape_edgar_atom(session, batch, edgar_stats, log, conn)
-            stats.merge(edgar_stats)
-            edgar_stats.log_summary(log, "edgar_atom")
+            _run_source(
+                "edgar_atom",
+                lambda s: _scrape_edgar_atom(session, batch, s, log, conn),
+                stats,
+                log,
+            )
 
             if config.EDGAR_BACKFILL_ENABLED:
-                backfill_stats = SkipStats()
-                _scrape_edgar_backfill(session, batch, backfill_stats, log)
-                stats.merge(backfill_stats)
-                backfill_stats.log_summary(log, "edgar_backfill")
+                _run_source(
+                    "edgar_backfill",
+                    lambda s: _scrape_edgar_backfill(session, batch, s, log),
+                    stats,
+                    log,
+                )
 
-            reuters_stats = SkipStats()
-            _scrape_rss_feed(
-                session,
-                config.REUTERS_RSS,
-                "reuters_rss",
-                batch,
-                reuters_stats,
-                log,
-                conn,
-            )
-            stats.merge(reuters_stats)
-            reuters_stats.log_summary(log, "reuters")
+            for feed_key, feed_url in config.RSS_FEEDS:
+                _run_source(
+                    feed_key,
+                    lambda s, u=feed_url, k=feed_key: _scrape_rss_feed(
+                        session, u, k, batch, s, log, conn
+                    ),
+                    stats,
+                    log,
+                )
 
-            ap_stats = SkipStats()
-            _scrape_rss_feed(session, config.AP_RSS, "ap_rss", batch, ap_stats, log, conn)
-            stats.merge(ap_stats)
-            ap_stats.log_summary(log, "ap")
+            if config.ALPACA_NEWS_ENABLED:
+                _run_source(
+                    "alpaca_news",
+                    lambda s: _scrape_alpaca_news(batch, s, log),
+                    stats,
+                    log,
+                )
 
             inserted, duplicates = batch.flush()
             stats.skip("duplicate", duplicates)
@@ -559,7 +634,7 @@ def run() -> None:
         session.close()
 
     stats.log_summary(log, "scraper.run total")
-    log.info("scraper.run done inserted=%s", inserted)
+    log.info("scraper.run done inserted=%s duplicates=%s", inserted, duplicates)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,37 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_tagged_stories_tagged_at ON tagged_stories(tagged_at);
         CREATE INDEX IF NOT EXISTS idx_signals_ticker_created ON signals(ticker, created_at);
 
+        CREATE TABLE IF NOT EXISTS option_trades (
+          id                     INTEGER PRIMARY KEY,
+          signal_id              INTEGER REFERENCES signals(id) ON DELETE SET NULL,
+          underlying             TEXT NOT NULL,
+          contract_symbol        TEXT NOT NULL,
+          contract_type          TEXT,
+          expiration_date        TEXT,
+          strike                 REAL,
+          qty                    INTEGER,
+          entry_limit_price      REAL,
+          entry_price            REAL,
+          entry_underlying_price REAL,
+          entry_delta            REAL,
+          entry_iv               REAL,
+          entry_order_id         TEXT,
+          exit_order_id          TEXT,
+          exit_price             REAL,
+          pnl                    REAL,
+          status                 TEXT,
+          exit_reason            TEXT,
+          created_at             DATETIME,
+          opened_at              DATETIME,
+          closed_at              DATETIME,
+          updated_at             DATETIME
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_option_trades_status ON option_trades(status);
+        CREATE INDEX IF NOT EXISTS idx_option_trades_signal ON option_trades(signal_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_option_trades_entry_order
+          ON option_trades(entry_order_id);
+
         CREATE TABLE IF NOT EXISTS scraper_state (
           feed_key            TEXT PRIMARY KEY,
           last_seen_url       TEXT,

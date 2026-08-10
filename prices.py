@@ -1,89 +1,101 @@
+"""Price lookups backed by Alpaca market data.
+
+Previously Yahoo Finance, which now returns `429 Edge: Too Many Requests` for
+unauthenticated callers on both the chart and quoteSummary endpoints. Every
+caller here failed closed, so no signal could ever pass the scorer.
+"""
+
 from __future__ import annotations
 
 import datetime as dt
 from typing import Any
 
-import requests
+import alpaca
+import config
 
 
 class PriceError(RuntimeError):
     pass
 
 
-def _chart(symbol: str, *, rng: str, interval: str) -> dict[str, Any]:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {
-        "range": rng,
-        "interval": interval,
-        "includePrePost": "false",
-        "events": "div,splits",
-    }
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, dict) or "chart" not in data:
-        raise PriceError("Unexpected Yahoo chart response")
-    err = data.get("chart", {}).get("error")
-    if err:
-        raise PriceError(str(err))
-    return data
+def _bars(symbol: str, *, timeframe: str, start: dt.datetime, limit: int = 10000) -> list:
+    body = alpaca.data_request(
+        "/v2/stocks/" + symbol.upper() + "/bars",
+        params={
+            "timeframe": timeframe,
+            "start": start.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "limit": limit,
+            "adjustment": "split",
+            "feed": config.STOCK_FEED,
+        },
+    )
+    bars = body.get("bars") if isinstance(body, dict) else None
+    return bars or []
 
 
 def latest_close_and_close_24h_ago(symbol: str) -> tuple[float, float]:
-    """
-    Uses 1h candles over ~5 days to approximate a 24h move.
-    Returns (latest_close, close_near_24h_ago).
-    """
-    data = _chart(symbol, rng="5d", interval="1h")
-    result = (data.get("chart", {}).get("result") or [None])[0]
-    if not result:
-        raise PriceError("No chart result")
-
-    ts = result.get("timestamp") or []
-    closes = (
-        (result.get("indicators", {}).get("quote") or [{}])[0].get("close") or []
-    )
-    if not ts or not closes or len(ts) != len(closes):
-        raise PriceError("Missing timestamps/closes")
-
-    pairs: list[tuple[int, float]] = []
-    for t, c in zip(ts, closes):
-        if c is None:
+    """Returns (latest_close, close_near_24h_ago) from hourly bars."""
+    start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)
+    bars = _bars(symbol, timeframe="1Hour", start=start)
+    pairs: list = []
+    for bar in bars:
+        close = bar.get("c")
+        ts = bar.get("t")
+        if close is None or not ts:
             continue
-        pairs.append((int(t), float(c)))
-    if len(pairs) < 2:
-        raise PriceError("Insufficient candle data")
+        try:
+            parsed = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        pairs.append((parsed, float(close)))
 
+    if len(pairs) < 2:
+        raise PriceError("insufficient bar data for " + symbol)
+
+    pairs.sort(key=lambda p: p[0])
     latest_t, latest_c = pairs[-1]
-    target_t = latest_t - 24 * 3600
-    # Find candle timestamp closest to target_t.
-    best = min(pairs, key=lambda p: abs(p[0] - target_t))
+    target = latest_t - dt.timedelta(hours=24)
+    best = min(pairs, key=lambda p: abs((p[0] - target).total_seconds()))
     return latest_c, best[1]
 
 
 def close_on_or_after(symbol: str, base_ts: dt.datetime, days_after: int) -> float | None:
-    """
-    Uses 1d candles over a 1mo range; returns the first close on/after base_date+days_after.
-    """
-    data = _chart(symbol, rng="1mo", interval="1d")
-    result = (data.get("chart", {}).get("result") or [None])[0]
-    if not result:
-        return None
-    ts = result.get("timestamp") or []
-    closes = (
-        (result.get("indicators", {}).get("quote") or [{}])[0].get("close") or []
-    )
-    if not ts or not closes:
-        return None
+    """First daily close on/after base_ts + days_after, or None if not yet available."""
+    if base_ts.tzinfo is None:
+        base_ts = base_ts.replace(tzinfo=dt.timezone.utc)
+    target_date = (base_ts.astimezone(dt.timezone.utc) + dt.timedelta(days=days_after)).date()
 
-    base_date = base_ts.astimezone(dt.UTC).date()
-    target_date = base_date + dt.timedelta(days=days_after)
-
-    for t, c in zip(ts, closes):
-        if c is None:
+    bars = _bars(symbol, timeframe="1Day", start=base_ts - dt.timedelta(days=1), limit=90)
+    for bar in bars:
+        ts = bar.get("t")
+        close = bar.get("c")
+        if not ts or close is None:
             continue
-        d = dt.datetime.fromtimestamp(int(t), tz=dt.UTC).date()
-        if d >= target_date:
-            return float(c)
+        try:
+            bar_date = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).date()
+        except ValueError:
+            continue
+        if bar_date >= target_date:
+            return float(close)
     return None
 
+
+def latest_price(symbol: str) -> float | None:
+    """Latest trade price, falling back to the most recent minute bar close."""
+    price = alpaca.latest_stock_trade_price(symbol)
+    if price:
+        return price
+    bars = _bars(
+        symbol,
+        timeframe="1Min",
+        start=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=5),
+        limit=1000,
+    )
+    if not bars:
+        return None
+    last = bars[-1].get("c")
+    return float(last) if last else None
+
+
+def snapshot(symbol: str) -> dict[str, Any]:
+    return alpaca.data_request("/v2/stocks/" + symbol.upper() + "/snapshot", params={"feed": config.STOCK_FEED})

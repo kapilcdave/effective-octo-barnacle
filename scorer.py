@@ -5,6 +5,7 @@ import json
 import logging
 from collections import defaultdict
 
+import alpaca
 import config
 from db import db_session
 from prices import latest_close_and_close_24h_ago
@@ -65,6 +66,9 @@ def _prices_ok_24h(ticker: str) -> tuple[bool, float | None]:
     """
     try:
         now_price, ref_price = latest_close_and_close_24h_ago(ticker)
+    except alpaca.AlpacaCredentialsError:
+        # Configuration failure, not a verdict on the ticker: let it surface.
+        raise
     except Exception:
         return False, None
     if ref_price <= 0:

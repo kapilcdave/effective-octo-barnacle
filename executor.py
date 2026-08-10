@@ -5,8 +5,7 @@ import logging
 import sys
 from typing import Any
 
-import requests
-
+import alpaca
 import config
 from db import db_session
 from runtime import get_logger
@@ -17,30 +16,12 @@ def _logger() -> logging.Logger:
 
 
 def _alpaca_request(method: str, path: str, *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    if not config.ALPACA_KEY or config.ALPACA_KEY == "your-key":
-        raise RuntimeError("ALPACA_KEY not set")
-    if not config.ALPACA_SECRET or config.ALPACA_SECRET == "your-key":
-        raise RuntimeError("ALPACA_SECRET not set")
-
-    headers = {
-        "APCA-API-KEY-ID": config.ALPACA_KEY,
-        "APCA-API-SECRET-KEY": config.ALPACA_SECRET,
-        "Content-Type": "application/json",
-    }
-    url = config.ALPACA_BASE_URL.rstrip("/") + path
-    response = requests.request(method, url, headers=headers, json=payload, timeout=30)
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as e:
-        request_id = response.headers.get("X-Request-ID", "")
-        detail = response.text.strip()
-        suffix = f" x-request-id={request_id}" if request_id else ""
-        raise RuntimeError(f"Alpaca {method} {path} failed: {response.status_code} {detail}{suffix}") from e
-    return response.json()
+    """Deprecated: kept as a shim, use alpaca.trading_request directly."""
+    return alpaca.trading_request(method, path, payload=payload)
 
 
 def get_account() -> dict[str, Any]:
-    return _alpaca_request("GET", "/v2/account")
+    return alpaca.get_account()
 
 
 def _get_account_equity() -> float:
@@ -99,7 +80,7 @@ def build_order(signal_id: int) -> dict[str, Any]:
 
 
 def submit_signal(signal_id: int) -> dict[str, Any]:
-    return _alpaca_request("POST", "/v2/orders", payload=build_order(signal_id))
+    return alpaca.submit_order(build_order(signal_id))
 
 
 def _usage(log: logging.Logger) -> None:
